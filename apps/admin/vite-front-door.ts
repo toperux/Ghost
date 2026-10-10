@@ -1,9 +1,10 @@
+import { connect, type Socket } from 'node:net';
 import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import sirv from 'sirv';
 import type { Plugin, ProxyOptions } from 'vite';
 
-// Built to apps/<name>/umd by each app's `vite build --watch`
+// Built to apps/<name>/umd by each app's `build`, or its watcher under `pnpm dev:public`
 const PUBLIC_APPS = [
   'portal',
   'comments-ui',
@@ -57,11 +58,34 @@ export function ghostFrontDoorPlugin(backend: string, devBase: string): Plugin {
           (res) => res.status < 500,
           () => false,
         );
-      const ready = (async () => {
+      const waitForGhost = async () => {
         while (!(await isUp())) {
           await sleep(500);
         }
-      })();
+      };
+      let ready = waitForGhost();
+
+      // A nodemon restart closes every connection to Ghost, so an idle one held open notices
+      // the restart before the next request does. A running Ghost times it out with a 408.
+      const { hostname, port } = new URL(backend);
+      let watcher: Socket | undefined;
+      const watchForRestart = () =>
+        void ready.then(() => {
+          let timedOut = false;
+          watcher = connect(Number(port), hostname).unref();
+          watcher.once('data', () => (timedOut = true));
+          watcher.on('error', () => {});
+          watcher.once('close', () => {
+            if (server.httpServer?.listening) {
+              if (!timedOut) {
+                ready = waitForGhost();
+              }
+              watchForRestart();
+            }
+          });
+        });
+      watchForRestart();
+      server.httpServer?.once('close', () => watcher?.destroy());
 
       const printUrls = server.printUrls.bind(server);
       server.printUrls = () => {
